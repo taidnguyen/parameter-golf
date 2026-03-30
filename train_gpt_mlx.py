@@ -93,6 +93,12 @@ class Hyperparameters:
     muon_momentum_warmup_start: float = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps: int = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    # Data loader shard stride. 1 = sequential (default). 0 = auto-pick coprime stride.
+    loader_stride: int = int(os.environ.get("LOADER_STRIDE", 1))
+    # MLP activation. 0 = ReLU² (default), 1 = SwiGLU (hidden scaled to 2/3 to match param count).
+    use_swiglu: bool = bool(int(os.environ.get("USE_SWIGLU", "0")))
+    # LeakyReLU² negative slope. 0.0 = standard ReLU² (default). 0.5 is SOTA, 0.75 also competitive.
+    leaky_relu_slope: float = float(os.environ.get("LEAKY_RELU_SLOPE", "0.0"))
 
     out_dir: str = os.environ.get("OUT_DIR", "logs")
 
@@ -192,6 +198,14 @@ def zeropower_newtonschulz5(g: mx.array, steps: int, eps: float = 1e-7) -> mx.ar
     return x.astype(g.dtype)
 
 
+def _coprime_stride(n: int) -> int:
+    """Return a stride coprime to n in (n//2, n) so the shard walk visits all shards."""
+    for s in range(n // 2 + 1, n):
+        if math.gcd(s, n) == 1:
+            return s
+    return 1  # fallback for n <= 2
+
+
 def load_data_shard(path: Path) -> np.ndarray:
     header_bytes = 256 * np.dtype("<i4").itemsize
     token_bytes = np.dtype("<u2").itemsize
@@ -218,10 +232,13 @@ class TokenStream:
         pattern: str,
         log_fn: Callable[[str], None] | None = None,
         dataset_name: str = "",
+        stride: int = 1,
     ):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
+        n = len(self.files)
+        self.stride = _coprime_stride(n) if stride == 0 else stride
         self.epoch = 1
         self.file_idx = 0
         self.log_fn = log_fn
@@ -230,7 +247,7 @@ class TokenStream:
         self.pos = 0
 
     def next_file(self) -> None:
-        self.file_idx = (self.file_idx + 1) % len(self.files)
+        self.file_idx = (self.file_idx + self.stride) % len(self.files)
         if self.file_idx == 0:
             self.epoch += 1
             if self.log_fn is not None:
@@ -260,8 +277,9 @@ class TokenLoader:
         pattern: str,
         log_fn: Callable[[str], None] | None = None,
         dataset_name: str = "",
+        stride: int = 1,
     ):
-        self.stream = TokenStream(pattern, log_fn=log_fn, dataset_name=dataset_name)
+        self.stream = TokenStream(pattern, log_fn=log_fn, dataset_name=dataset_name, stride=stride)
 
     def next_batch(self, batch_tokens: int, seq_len: int) -> tuple[mx.array, mx.array]:
         usable = (batch_tokens // seq_len) * seq_len
@@ -339,16 +357,30 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # Baseline MLP uses relu^2 instead of GELU/SiLU. It is cheap and works well in this setup.
-    def __init__(self, dim: int, mlp_mult: int):
+    # relu^2 MLP. slope=0 → relu², slope>0 → leakyrelu².
+    def __init__(self, dim: int, mlp_mult: int, slope: float = 0.0):
         super().__init__()
         hidden = dim * mlp_mult
+        self.slope = slope
         self.fc = CastedLinear(dim, hidden)
         self.proj = CastedLinear(hidden, dim)
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = nn.relu(self.fc(x))
+        x = nn.leaky_relu(self.fc(x), negative_slope=self.slope) if self.slope > 0.0 else nn.relu(self.fc(x))
         return self.proj(x * x)
+
+
+class SwiGLUMLP(nn.Module):
+    # SwiGLU: proj(fc(x) * silu(gate(x))). Hidden scaled to 2/3 to keep param count comparable.
+    def __init__(self, dim: int, mlp_mult: int):
+        super().__init__()
+        hidden = int(dim * mlp_mult * 2 / 3)
+        self.gate = CastedLinear(dim, hidden)
+        self.fc = CastedLinear(dim, hidden)
+        self.proj = CastedLinear(hidden, dim)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.proj(self.fc(x) * nn.silu(self.gate(x)))
 
 
 class Block(nn.Module):
@@ -360,12 +392,14 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        use_swiglu: bool = False,
+        leaky_relu_slope: float = 0.0,
     ):
         super().__init__()
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = SwiGLUMLP(dim, mlp_mult) if use_swiglu else MLP(dim, mlp_mult, slope=leaky_relu_slope)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
@@ -386,7 +420,7 @@ class GPT(nn.Module):
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 qk_gain_init: float, use_swiglu: bool = False, leaky_relu_slope: float = 0.0):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -399,7 +433,7 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, use_swiglu=use_swiglu, leaky_relu_slope=leaky_relu_slope)
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
@@ -880,10 +914,7 @@ def main() -> None:
     # ==============================================================================
     mx.random.seed(args.seed)
 
-    train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
-
-    # ==============================================================================
-    # MODEL + OPTIMIZER SETUP
+    train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name, stride=args.loader_stride)
     # ==============================================================================
     model = GPT(
         vocab_size=args.vocab_size,
@@ -897,6 +928,8 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        use_swiglu=args.use_swiglu,
+        leaky_relu_slope=args.leaky_relu_slope,
     )
     opt = SplitOptimizers(model, args)
 
@@ -993,7 +1026,7 @@ def main() -> None:
         mx.eval(warm_val_loss)
         mx.synchronize()
 
-        train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
+        train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name, stride=args.loader_stride)
 
     train_time_ms = 0.0
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None

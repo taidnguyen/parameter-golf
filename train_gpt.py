@@ -85,6 +85,12 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    # Data loader shard stride. 1 = sequential (default). 0 = auto-pick coprime stride.
+    loader_stride = int(os.environ.get("LOADER_STRIDE", 1))
+    # MLP activation. 0 = ReLU² (default), 1 = SwiGLU (hidden scaled to 2/3 to match param count).
+    use_swiglu = bool(int(os.environ.get("USE_SWIGLU", "0")))
+    # LeakyReLU² negative slope. 0.0 = standard ReLU² (default). 0.5 is SOTA, 0.75 also competitive.
+    leaky_relu_slope = float(os.environ.get("LEAKY_RELU_SLOPE", "0.0"))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -423,8 +429,16 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
 
 
 # -----------------------------
-# DATA LOADING 
+# DATA LOADING
 # -----------------------------
+
+def _coprime_stride(n: int) -> int:
+    """Return a stride coprime to n in (n//2, n) so the shard walk visits all shards."""
+    for s in range(n // 2 + 1, n):
+        if math.gcd(s, n) == 1:
+            return s
+    return 1  # fallback for n <= 2
+
 
 def load_data_shard(file: Path) -> Tensor:
     header_bytes = 256 * np.dtype("<i4").itemsize
@@ -446,16 +460,18 @@ def load_data_shard(file: Path) -> Tensor:
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
-    def __init__(self, pattern: str):
+    def __init__(self, pattern: str, stride: int = 1):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
+        n = len(self.files)
+        self.stride = _coprime_stride(n) if stride == 0 else stride
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
 
     def _advance_file(self) -> None:
-        self.file_idx = (self.file_idx + 1) % len(self.files)
+        self.file_idx = (self.file_idx + self.stride) % len(self.files)
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
 
@@ -477,11 +493,11 @@ class TokenStream:
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
     # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
-    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
+    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device, stride: int = 1):
         self.rank = rank
         self.world_size = world_size
         self.device = device
-        self.stream = TokenStream(pattern)
+        self.stream = TokenStream(pattern, stride=stride)
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
@@ -604,17 +620,32 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    # relu^2 MLP from the original modded-nanogpt setup. slope=0 → relu², slope>0 → leakyrelu².
+    def __init__(self, dim: int, mlp_mult: int, slope: float = 0.0):
         super().__init__()
         hidden = mlp_mult * dim
+        self.slope = slope
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
+        x = F.leaky_relu(self.fc(x), negative_slope=self.slope) if self.slope > 0.0 else torch.relu(self.fc(x))
         return self.proj(x.square())
+
+
+class SwiGLUMLP(nn.Module):
+    # SwiGLU: proj(fc(x) * silu(gate(x))). Hidden scaled to 2/3 to keep param count comparable.
+    def __init__(self, dim: int, mlp_mult: int):
+        super().__init__()
+        hidden = int(dim * mlp_mult * 2 / 3)
+        self.gate = CastedLinear(dim, hidden, bias=False)
+        self.fc = CastedLinear(dim, hidden, bias=False)
+        self.proj = CastedLinear(hidden, dim, bias=False)
+        self.proj._zero_init = True
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.proj(self.fc(x) * F.silu(self.gate(x)))
 
 
 class Block(nn.Module):
@@ -626,12 +657,14 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        use_swiglu: bool = False,
+        leaky_relu_slope: float = 0.0,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = SwiGLUMLP(dim, mlp_mult) if use_swiglu else MLP(dim, mlp_mult, slope=leaky_relu_slope)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -659,6 +692,8 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        use_swiglu: bool = False,
+        leaky_relu_slope: float = 0.0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -680,6 +715,8 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    use_swiglu=use_swiglu,
+                    leaky_relu_slope=leaky_relu_slope,
                 )
                 for i in range(num_layers)
             ]
@@ -835,6 +872,8 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        use_swiglu=args.use_swiglu,
+        leaky_relu_slope=args.leaky_relu_slope,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -913,7 +952,7 @@ def main() -> None:
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device, stride=args.loader_stride)
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -958,10 +997,7 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-
-    # -----------------------------
-    # MAIN TRAINING LOOP
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device, stride=args.loader_stride)
     # -----------------------------
 
     training_time_ms = 0.0
