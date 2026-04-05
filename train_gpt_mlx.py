@@ -18,6 +18,11 @@ import zlib
 from collections.abc import Callable
 from pathlib import Path
 
+try:
+    import wandb as _wandb
+except ImportError:
+    _wandb = None
+
 import numpy as np
 import sentencepiece as spm
 
@@ -95,10 +100,10 @@ class Hyperparameters:
     grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
     # Data loader shard stride. 1 = sequential (default). 0 = auto-pick coprime stride.
     loader_stride: int = int(os.environ.get("LOADER_STRIDE", 1))
-    # MLP activation. 0 = ReLU² (default), 1 = SwiGLU (hidden scaled to 2/3 to match param count).
-    use_swiglu: bool = bool(int(os.environ.get("USE_SWIGLU", "0")))
     # LeakyReLU² negative slope. 0.0 = standard ReLU² (default). 0.5 is SOTA, 0.75 also competitive.
     leaky_relu_slope: float = float(os.environ.get("LEAKY_RELU_SLOPE", "0.0"))
+    # W&B logging. Set USE_WANDB=1 to enable; requires `pip install wandb` and `wandb login`.
+    use_wandb: bool = bool(int(os.environ.get("USE_WANDB", "0")))
 
     out_dir: str = os.environ.get("OUT_DIR", "logs")
 
@@ -370,19 +375,6 @@ class MLP(nn.Module):
         return self.proj(x * x)
 
 
-class SwiGLUMLP(nn.Module):
-    # SwiGLU: proj(fc(x) * silu(gate(x))). Hidden scaled to 2/3 to keep param count comparable.
-    def __init__(self, dim: int, mlp_mult: int):
-        super().__init__()
-        hidden = int(dim * mlp_mult * 2 / 3)
-        self.gate = CastedLinear(dim, hidden)
-        self.fc = CastedLinear(dim, hidden)
-        self.proj = CastedLinear(hidden, dim)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return self.proj(self.fc(x) * nn.silu(self.gate(x)))
-
-
 class Block(nn.Module):
     def __init__(
         self,
@@ -392,14 +384,13 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
-        use_swiglu: bool = False,
         leaky_relu_slope: float = 0.0,
     ):
         super().__init__()
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = SwiGLUMLP(dim, mlp_mult) if use_swiglu else MLP(dim, mlp_mult, slope=leaky_relu_slope)
+        self.mlp = MLP(dim, mlp_mult, slope=leaky_relu_slope)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
@@ -420,7 +411,7 @@ class GPT(nn.Module):
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float, use_swiglu: bool = False, leaky_relu_slope: float = 0.0):
+                 qk_gain_init: float, leaky_relu_slope: float = 0.0):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -433,7 +424,7 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, use_swiglu=use_swiglu, leaky_relu_slope=leaky_relu_slope)
+            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, leaky_relu_slope=leaky_relu_slope)
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
@@ -928,7 +919,6 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
-        use_swiglu=args.use_swiglu,
         leaky_relu_slope=args.leaky_relu_slope,
     )
     opt = SplitOptimizers(model, args)
@@ -989,6 +979,9 @@ def main() -> None:
         f"linear_weight:{model.blocks[0].attn.c_q.weight.dtype} "
         f"skip_weights:{model.skip_weights.dtype}"
     )
+
+    if args.use_wandb and _wandb is not None:
+        _wandb.init(project="parameter-golf", name=args.run_id, config={k: v for k, v in vars(args.__class__).items() if not k.startswith("_")})
 
     # ==============================================================================
     # TRAINING LOOP
@@ -1052,6 +1045,8 @@ def main() -> None:
                     f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                     f"train_time:{train_time_ms:.0f}ms step_avg:{train_time_ms / max(step, 1):.2f}ms"
                 )
+            if args.use_wandb and _wandb is not None:
+                _wandb.log({"val/loss": val_loss, "val/bpb": val_bpb, "tokens_seen": step * args.train_batch_tokens}, step=step)
             t0 = time.perf_counter()
         if last_step:
             if stop_after_step is not None and step < args.iterations:
@@ -1086,6 +1081,14 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss_value:.4f} "
                 f"train_time:{approx_train_time_ms:.0f}ms step_avg:{approx_train_time_ms / step:.2f}ms tok_s:{tok_s:.0f}"
             )
+            if args.use_wandb and _wandb is not None:
+                _wandb.log({
+                    "train/loss": train_loss_value,
+                    "train/lr_scale": lr_mul,
+                    "train/step_ms": approx_train_time_ms / step,
+                    "train/tok_s": tok_s,
+                    "tokens_seen": step * args.train_batch_tokens,
+                }, step=step)
         if max_wallclock_ms is not None and stop_after_step is None and approx_train_time_ms >= max_wallclock_ms:
             stop_after_step = step
 
@@ -1131,6 +1134,10 @@ def main() -> None:
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
     log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
     log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    if args.use_wandb and _wandb is not None:
+        _wandb.log({"final/val_bpb": q_val_bpb, "final/val_loss": q_val_loss, "final/artifact_bytes": quant_file_bytes})
+        _wandb.finish()
 
 
 if __name__ == "__main__":
